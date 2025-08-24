@@ -1,0 +1,89 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [master]
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    env:
+      GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/gcp-key.json
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: pip install --upgrade pip && pip install -r requirements.txt
+
+      - name: Write GCP credentials to file
+        run: echo '${{ secrets.GCP_CREDENTIALS }}' > ${{ env.GOOGLE_APPLICATION_CREDENTIALS }}
+
+      - name: Configure DVC to use GCS remote
+        run: dvc remote modify gcsremote credentialpath ${{ env.GOOGLE_APPLICATION_CREDENTIALS }}
+
+      - name: DVC Pull
+        run: dvc pull
+
+      - name: Run data checks and training
+        run: |
+          python src/check_poisoning.py
+          python src/check_fairness.py
+          python src/generate_explanations.py
+          python src/train.py
+
+      - name: Authenticate Docker to Google Artifact Registry
+        run: |
+          gcloud auth activate-service-account --key-file=${{ env.GOOGLE_APPLICATION_CREDENTIALS }}
+          gcloud auth configure-docker us-central1-docker.pkg.dev
+
+      - name: Build Docker image
+        run: docker build -t us-central1-docker.pkg.dev/utility-glider-469806-m2/heart-disease-repo/heart-disease-api:latest .
+
+      - name: Push Docker image
+        run: docker push us-central1-docker.pkg.dev/utility-glider-469806-m2/heart-disease-repo/heart-disease-api:latest
+
+      - name: Set up gcloud CLI
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: utility-glider-469806-m2
+          service_account_key: ${{ secrets.GCP_CREDENTIALS }}
+          export_default_credentials: true
+
+      - name: Set up kubectl
+        run: |
+          gcloud container clusters get-credentials heart-disease-cluster --zone us-central1-c --project utility-glider-469806-m2
+
+      - name: Update K8s deployment image
+        run: |
+          kubectl set image deployment/heart-disease-api api=us-central1-docker.pkg.dev/utility-glider-469806-m2/heart-disease-repo/heart-disease-api:latest || kubectl apply -f k8s/deployment.yaml
+
+      - name: Apply K8s service and HPA
+        run: |
+          kubectl apply -f k8s/service.yaml
+          kubectl apply -f k8s/hpa.yaml
+
+      - name: Wait for service external IP
+        run: |
+          sleep 60
+          kubectl get svc heart-disease-service
+
+      # CML Report Step (requires CML_REPO_TOKEN secret)
+      - name: CML Report
+        env:
+          REPO_TOKEN: ${{ secrets.CML_REPO_TOKEN }}
+        run: |
+          pip install cml
+          echo "## Heart Disease Model Report" > report.md
+          echo "\n### Accuracy and Fairness" >> report.md
+          python src/check_fairness.py >> report.md
+          echo "\n### Poisoning Attack" >> report.md
+          python src/poison_attack.py >> report.md
+          echo "\n### SHAP Explainability" >> report.md
+          python src/generate_explanations.py >> report.md
+          cml comment create report.md
